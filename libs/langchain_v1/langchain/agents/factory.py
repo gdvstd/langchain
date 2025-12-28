@@ -75,6 +75,64 @@ FALLBACK_MODELS_WITH_STRUCTURED_OUTPUT = [
     "o3-mini",
 ]
 
+_WRAP_MODEL_CALL_CACHE: dict[tuple[str, ...], Callable[..., Any] | None] = {}
+_AWRAP_MODEL_CALL_CACHE: dict[tuple[str, ...], Callable[..., Any] | None] = {}
+_WRAP_TOOL_CALL_CACHE: dict[tuple[str, ...], Callable[..., Any] | None] = {}
+_AWRAP_TOOL_CALL_CACHE: dict[tuple[str, ...], Callable[..., Any] | None] = {}
+
+
+def _middleware_cache_key(middleware: Sequence[AgentMiddleware[Any, Any]]) -> tuple[str, ...]:
+    """Build a cache key based on middleware types and ordering."""
+    return tuple(instance.__class__.__name__ for instance in middleware)
+
+
+def _get_cached_wrapper(
+    middleware: Sequence[AgentMiddleware[Any, Any]],
+    *,
+    wrapper_attr: str,
+    chain_func: Callable[[Sequence[Callable[..., Any]]], Callable[..., Any] | None],
+    cache: dict[tuple[str, ...], Callable[..., Any] | None],
+) -> Callable[..., Any] | None:
+    """Return a cached wrapper chain or build one if needed."""
+    if not middleware:
+        return None
+
+    cache_key = _middleware_cache_key(middleware)
+    if cache_key in cache:
+        return cache[cache_key]
+
+    wrappers = [getattr(instance, wrapper_attr) for instance in middleware]
+    composed = chain_func(wrappers)
+    cache[cache_key] = composed
+    return composed
+
+
+def _compose_middleware_wrappers(
+    *,
+    sync_middleware: Sequence[AgentMiddleware[Any, Any]],
+    async_middleware: Sequence[AgentMiddleware[Any, Any]],
+    sync_attr: str,
+    async_attr: str,
+    sync_chain: Callable[[Sequence[Callable[..., Any]]], Callable[..., Any] | None],
+    async_chain: Callable[[Sequence[Callable[..., Any]]], Callable[..., Any] | None],
+    sync_cache: dict[tuple[str, ...], Callable[..., Any] | None],
+    async_cache: dict[tuple[str, ...], Callable[..., Any] | None],
+) -> tuple[Callable[..., Any] | None, Callable[..., Any] | None]:
+    """Compose sync and async wrappers with memoization."""
+    sync_wrapper = _get_cached_wrapper(
+        sync_middleware,
+        wrapper_attr=sync_attr,
+        chain_func=sync_chain,
+        cache=sync_cache,
+    )
+    async_wrapper = _get_cached_wrapper(
+        async_middleware,
+        wrapper_attr=async_attr,
+        chain_func=async_chain,
+        cache=async_cache,
+    )
+    return sync_wrapper, async_wrapper
+
 
 def _normalize_to_model_response(result: ModelResponse | AIMessage) -> ModelResponse:
     """Normalize middleware return value to ModelResponse."""
@@ -739,12 +797,6 @@ def create_agent(
         or m.__class__.awrap_tool_call is not AgentMiddleware.awrap_tool_call
     ]
 
-    # Chain all wrap_tool_call handlers into a single composed handler
-    wrap_tool_call_wrapper = None
-    if middleware_w_wrap_tool_call:
-        wrappers = [m.wrap_tool_call for m in middleware_w_wrap_tool_call]
-        wrap_tool_call_wrapper = _chain_tool_call_wrappers(wrappers)
-
     # Collect middleware with awrap_tool_call or wrap_tool_call hooks
     # Include middleware with either implementation to ensure NotImplementedError is raised
     # when middleware doesn't support the execution path
@@ -755,11 +807,17 @@ def create_agent(
         or m.__class__.wrap_tool_call is not AgentMiddleware.wrap_tool_call
     ]
 
-    # Chain all awrap_tool_call handlers into a single composed async handler
-    awrap_tool_call_wrapper = None
-    if middleware_w_awrap_tool_call:
-        async_wrappers = [m.awrap_tool_call for m in middleware_w_awrap_tool_call]
-        awrap_tool_call_wrapper = _chain_async_tool_call_wrappers(async_wrappers)
+    # Chain wrap_tool_call handlers into composed sync/async handlers
+    wrap_tool_call_wrapper, awrap_tool_call_wrapper = _compose_middleware_wrappers(
+        sync_middleware=middleware_w_wrap_tool_call,
+        async_middleware=middleware_w_awrap_tool_call,
+        sync_attr="wrap_tool_call",
+        async_attr="awrap_tool_call",
+        sync_chain=_chain_tool_call_wrappers,
+        async_chain=_chain_async_tool_call_wrappers,
+        sync_cache=_WRAP_TOOL_CALL_CACHE,
+        async_cache=_AWRAP_TOOL_CALL_CACHE,
+    )
 
     # Setup tools
     tool_node: ToolNode | None = None
@@ -837,17 +895,17 @@ def create_agent(
         or m.__class__.wrap_model_call is not AgentMiddleware.wrap_model_call
     ]
 
-    # Compose wrap_model_call handlers into a single middleware stack (sync)
-    wrap_model_call_handler = None
-    if middleware_w_wrap_model_call:
-        sync_handlers = [m.wrap_model_call for m in middleware_w_wrap_model_call]
-        wrap_model_call_handler = _chain_model_call_handlers(sync_handlers)
-
-    # Compose awrap_model_call handlers into a single middleware stack (async)
-    awrap_model_call_handler = None
-    if middleware_w_awrap_model_call:
-        async_handlers = [m.awrap_model_call for m in middleware_w_awrap_model_call]
-        awrap_model_call_handler = _chain_async_model_call_handlers(async_handlers)
+    # Compose wrap_model_call handlers into a single middleware stack (sync/async)
+    wrap_model_call_handler, awrap_model_call_handler = _compose_middleware_wrappers(
+        sync_middleware=middleware_w_wrap_model_call,
+        async_middleware=middleware_w_awrap_model_call,
+        sync_attr="wrap_model_call",
+        async_attr="awrap_model_call",
+        sync_chain=_chain_model_call_handlers,
+        async_chain=_chain_async_model_call_handlers,
+        sync_cache=_WRAP_MODEL_CALL_CACHE,
+        async_cache=_AWRAP_MODEL_CALL_CACHE,
+    )
 
     state_schemas: set[type] = {m.state_schema for m in middleware}
     # Use provided state_schema if available, otherwise use base AgentState
